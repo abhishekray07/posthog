@@ -1,0 +1,162 @@
+name: Spike A - Jest on GitHub-hosted
+on:
+    workflow_dispatch:
+    # push trigger (filtered): GitHub does not register workflow_dispatch-only
+    # workflows on a non-default branch; a run starts only when .spike/run-a changes.
+    push:
+        branches: [openscion-runner-spike]
+        paths: ['.spike/run-a']
+
+permissions:
+    contents: read
+    actions: read
+
+env:
+    RUNS_ON_INTERNAL_PR: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+    # npm's audit blocks the pnpm bootstrap. See .github/actions/pnpm-install for why.
+    NPM_CONFIG_AUDIT: 'false'
+    NPM_CONFIG_FUND: 'false'
+
+jobs:
+    jest:
+        runs-on: ubuntu-24.04
+        # PRs run as many selective shards as the tests reachable from the changed
+        # files need under the file limit in .github/scripts/jest-select.js. The
+        # merge queue runs the full four-shard fanout. A copy of the repository lands
+        # on a slower GitHub-hosted runner pool, so it gets a longer budget.
+        timeout-minutes: ${{ github.repository == 'PostHog/posthog' && 20 || 30 }}
+        # A status function is required because select-jest-tests is skipped on the
+        # merge queue's run and on master pushes, and a skipped need would otherwise
+        # cascade a skip here.
+        # !cancelled() rather than always() so a superseded run's shards stop promptly.
+        # Skipped on master push: the merge queue already ran the full matrix for every
+        # landed commit, and the hourly scheduled run keeps master's jest coverage and
+        # its Trunk flaky baseline.
+        name: Jest test (${{ matrix.segment }} - ${{ matrix.chunk }})
+        strategy:
+            # If one test fails, still run the others
+            fail-fast: false
+            # On PRs, select-jest-tests narrows this to the tests reachable from the
+            # changed frontend source files, skips jest entirely (should_run=false) on
+            # a draft whose selection can't be trusted, or emits the full fanout when a
+            # ready PR's can't be. On the merge queue's run and the hourly scheduled run
+            # the job is skipped and this default applies: the full four-chunk fanout.
+            # Master pushes do not reach here at all (see the `if` above).
+            # `segment` is a single fixed value: it survives only as the naming
+            # token for job, JUnit file and artifact, which the timings reporter
+            # parses as `junit-results-frontend-<segment>-<chunk>`. There used to
+            # be a second FOSS segment that deleted ee/ and re-ran the suite, but
+            # ee/ holds no frontend code and nothing under frontend/, products/,
+            # common/ or packages/ imports from it, so the two segments ran
+            # byte-identical suites.
+            matrix:
+                segment: ['app']
+                chunk: [1]
+
+        steps:
+            # ubuntu-24.04 hands out several CPU models, and the same shard runs up to
+            # 1.4x slower on one than another, so timings are only comparable per model.
+            - name: Print runner CPU
+              run: lscpu | grep 'Model name' || true
+
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Mint setup-action GitHub token
+              id: setup-gh-token
+              if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+              continue-on-error: true
+              uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+              with:
+                  client-id: ${{ vars.GH_APP_POSTHOG_SETUP_ACTIONS_APP_ID }}
+                  private-key: ${{ secrets.GH_APP_POSTHOG_SETUP_ACTIONS_PRIVATE_KEY }}
+                  skip-token-revoke: true
+
+            - name: Install pnpm dependencies
+              uses: ./.github/actions/pnpm-install
+              with:
+                  install-command: pnpm --filter=@posthog/frontend... install --frozen-lockfile
+                  token: ${{ steps.setup-gh-token.outputs.token || github.token }}
+
+            - name: Test with Jest
+              id: run-jest
+              # continue-on-error so a failure doesn't fail the job here; the quarantine
+              # gate below is the verdict — it passes when every failure is an
+              # already-quarantined flake, fails otherwise.
+              continue-on-error: true
+              env:
+                  NODE_OPTIONS: --max-old-space-size=16384
+                  SHARD_INDEX: ${{ matrix.chunk }}
+                  SHARD_COUNT: ${{ matrix.shard_count || 4 }}
+                  MODE: ${{ needs.select-jest-tests.outputs.mode }}
+                  CHANGED_FILES: ${{ needs.select-jest-tests.outputs.changed_files }}
+                  JEST_JUNIT_OUTPUT_DIR: ${{ github.workspace }}/junit-results
+                  JEST_JUNIT_OUTPUT_NAME: junit-${{ matrix.segment }}-${{ matrix.chunk }}.xml
+                  # Trunk attributes flakes by test file; jest-junit's default suite name is the
+                  # top-level describe, which collides across files. Anchor identity to the file.
+                  JEST_JUNIT_SUITE_NAME: '{filepath}'
+                  JEST_JUNIT_ADD_FILE_ATTRIBUTE: 'true'
+              run: |
+                  if [ "$MODE" = "selective" ]; then
+                      # --findRelatedTests walks jest's import graph from the changed
+                      # source files and runs the matching tests. Sharding keeps broad
+                      # import graphs within the job timeout.
+                      #
+                      # No --testPathPattern: it is mutually exclusive with
+                      # --findRelatedTests (jest folds both into one path regex and
+                      # matches nothing), and CHANGED_FILES is already scoped to
+                      # frontend source files by select-jest-tests. --passWithNoTests
+                      # so a changed source file with no related test doesn't fail the
+                      # run — the merge queue's trunk-merge/** run is the gate.
+                      pnpm --filter=@posthog/frontend build:products
+                      # shellcheck disable=SC2086
+                      pnpm --filter=@posthog/frontend exec jest \
+                          --forceExit \
+                          --passWithNoTests \
+                          --shard=$SHARD_INDEX/$SHARD_COUNT \
+                          --findRelatedTests $CHANGED_FILES
+                  else
+                      # 100% = one worker per available core. Public-repo ubuntu-24.04
+                      # runners have 4 vCPUs; a hardcoded 2 left half the machine idle.
+                      bin/turbo run test --filter=@posthog/frontend -- --maxWorkers=100%
+                  fi
+
+            - name: Upload test results
+              if: always()
+              # The quarantine gate reads the local JUnit files, so an artifact service failure must not change the test verdict.
+              continue-on-error: true
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  # Keep attempt 1's artifact available so the reporter can identify same-job
+                  # failures that pass when GitHub re-runs failed jobs on the same commit.
+                  name: junit-results-frontend-${{ matrix.segment }}-${{ matrix.chunk }}${{ github.run_attempt != '1' && format('-attempt{0}', github.run_attempt) || '' }}
+                  path: |
+                      junit-results/junit-*.xml
+                      junit-results/posthog-jest-quarantine-*.jsonl
+                  if-no-files-found: ignore
+                  retention-days: 1
+
+            # Best-effort Trunk upload (continue-on-error); the "Fail on jest failure" step below is
+            # the verdict, so a Trunk outage can't red a passing shard. Internal PRs only (needs the
+            # secret). No Trunk variant: variants told apart the old FOSS and EE uploads of the same
+            # test files, and only one segment remains.
+            # TRUNK_UPLOAD_ENABLED is the master kill-switch: when it is not 'true' this gate
+            # skips, so nothing uploads and no known flakes are quarantined. TRUNK_QUARANTINE_ENABLED
+            # splits the two — it defaults off, so set it to 'true' to let the verdict step below mask
+            # known flakes; otherwise any real failure reds the job (quarantining needs upload on too).
+            - name: Quarantine gate
+              id: quarantine_gate
+              continue-on-error: true
+              if: ${{ !cancelled() && env.RUNS_ON_INTERNAL_PR == 'true' && github.repository == 'PostHog/posthog' && github.actor != 'dependabot[bot]' && vars.TRUNK_UPLOAD_ENABLED == 'true' }}
+              uses: ./.github/actions/trunk-quarantine-gate
+              with:
+                  junit-paths: junit-results/junit-${{ matrix.segment }}-${{ matrix.chunk }}.xml
+                  test-collection-id: OZ6hVJ5z # frontend-jest
+                  previous-step-outcome: ${{ steps.run-jest.outcome }}
+                  token: ${{ secrets.TRUNK_API_TOKEN }}
+            # Verdict: red a real failure the gate didn't clear as a quarantined flake. != 'success'
+            # also covers the skipped gate on fork/Dependabot. Passing shards never red here.
+            - name: Fail on jest failure
+              if: ${{ !cancelled() && steps.run-jest.outcome == 'failure' && (vars.TRUNK_QUARANTINE_ENABLED != 'true' || steps.quarantine_gate.outcome != 'success') }}
+              shell: bash
+              run: exit 1
+
